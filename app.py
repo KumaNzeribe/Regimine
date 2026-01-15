@@ -1,12 +1,6 @@
 # app.py
 # Streamlit v1: SPY Morning Signal Terminal (Phase 1)
-# - Uses SPY daily candles + VIX as IV proxy (no option chain)
-# - Outputs: TRADE / NO TRADE, CALL/PUT bias, expiry window (30–45 DTE), time-stop date
-# - Logs trades to trades.csv (local)
-#
-# Run:
-#   pip install -r requirements.txt
-#   streamlit run app.py
+# Robust against yfinance MultiIndex columns.
 
 import math
 from datetime import date, timedelta
@@ -41,14 +35,9 @@ def bollinger_bandwidth(close: pd.Series, window: int = 20, n_std: float = 2.0) 
 
 
 def rolling_percentile_rank(series: pd.Series, lookback: int = 252) -> pd.Series:
-    """
-    Rolling percentile rank (0..100) of the last value in each lookback window.
-    Lower = cheaper/more compressed relative to its own history.
-    """
     def _pct_rank(x):
         s = pd.Series(x)
         return 100.0 * s.rank(pct=True).iloc[-1]
-
     return series.rolling(lookback).apply(_pct_rank, raw=False)
 
 
@@ -59,6 +48,16 @@ def safe_last_row(df: pd.DataFrame) -> pd.Series:
     return d.iloc[-1].copy()
 
 
+def ensure_series(x) -> pd.Series:
+    """Force yfinance outputs into a 1D Series."""
+    if isinstance(x, pd.DataFrame):
+        # take the first column
+        return x.iloc[:, 0].copy()
+    if isinstance(x, pd.Series):
+        return x.copy()
+    return pd.Series(x)
+
+
 # -----------------------------
 # Data loaders (cached)
 # -----------------------------
@@ -67,8 +66,24 @@ def load_daily(symbol: str, period: str = "2y") -> pd.DataFrame:
     df = yf.download(symbol, period=period, interval="1d", auto_adjust=False, progress=False)
     if df is None or df.empty:
         raise ValueError(f"No data returned for {symbol}.")
+
+    # Flatten MultiIndex columns if present (common yfinance gotcha)
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+
     df = df.rename(columns=str.lower)
     df.index = pd.to_datetime(df.index).tz_localize(None)
+
+    # Sanity: must contain standard OHLC
+    needed = {"open", "high", "low", "close"}
+    if not needed.issubset(set(df.columns)):
+        raise ValueError(f"{symbol} data missing OHLC columns. Columns: {list(df.columns)}")
+
+    # Ensure numeric
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
     return df
 
 
@@ -77,7 +92,7 @@ def load_daily(symbol: str, period: str = "2y") -> pd.DataFrame:
 # -----------------------------
 def compute_signal(
     spy_ohlc: pd.DataFrame,
-    vix_close: pd.Series,
+    vix_close_in,
     *,
     vix_pct_thresh: float,
     bb_width_pct_thresh: float,
@@ -87,6 +102,8 @@ def compute_signal(
     last_trade_date: date | None
 ) -> dict:
     df = spy_ohlc.copy()
+
+    # returns
     df["logret"] = np.log(df["close"]).diff()
 
     # RV
@@ -100,14 +117,15 @@ def compute_signal(
     # Trend / direction
     df["ema_20"] = ema(df["close"], 20)
 
-    # VIX proxy for IV cheapness
+    # VIX proxy (force 1D Series)
+    vix_close = ensure_series(vix_close_in)
     vix_aligned = vix_close.reindex(df.index).ffill()
     df["vix"] = vix_aligned
     df["vix_pct"] = rolling_percentile_rank(df["vix"], 252)
 
     latest = safe_last_row(df)
 
-    # Cooldown gate (calendar days)
+    # Cooldown gate
     if last_trade_date is not None:
         days_since = (date.today() - last_trade_date).days
         cooldown_block = days_since < cooldown_days
@@ -115,10 +133,10 @@ def compute_signal(
         days_since = None
         cooldown_block = False
 
-    # Conditions (FORCE scalars)
-    vix_ok = bool(latest["vix_pct"] < vix_pct_thresh)
-    compression_ok = bool(latest["bb_width_pct"] < bb_width_pct_thresh)
-    rv_rising = bool(latest["rv_5"] > latest["rv_20"])
+    # Conditions (force scalar bools)
+    vix_ok = bool(float(latest["vix_pct"]) < float(vix_pct_thresh))
+    compression_ok = bool(float(latest["bb_width_pct"]) < float(bb_width_pct_thresh))
+    rv_rising = bool(float(latest["rv_5"]) > float(latest["rv_20"]))
 
     enter = bool(vix_ok and compression_ok and rv_rising and (not cooldown_block))
 
@@ -128,7 +146,6 @@ def compute_signal(
     else:
         option_type = "CALL" if float(latest["close"]) > float(latest["ema_20"]) else "PUT"
 
-    # Date guidance
     today = date.today()
     earliest_exp = today + timedelta(days=30)
     latest_exp = today + timedelta(days=45)
@@ -180,7 +197,7 @@ def append_log(row: dict) -> None:
 
 
 # -----------------------------
-# Streamlit UI
+# UI
 # -----------------------------
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
@@ -213,11 +230,6 @@ last_trade_date_override = st.sidebar.date_input("Last trade date (override)", v
 use_override = st.sidebar.checkbox("Use override as last trade date", value=False)
 effective_last_trade = last_trade_date_override if use_override else last_trade_date
 
-if effective_last_trade is None:
-    st.sidebar.info("No prior trade date detected. Cooldown will not block entries.")
-else:
-    st.sidebar.write(f"Effective last trade date: **{effective_last_trade}**")
-
 # Load data
 with st.spinner("Loading SPY + VIX data..."):
     spy = load_daily("SPY", period="2y")
@@ -227,7 +239,7 @@ with st.spinner("Loading SPY + VIX data..."):
 try:
     result = compute_signal(
         spy,
-        vix_close=vix["close"],
+        vix_close_in=vix["close"],  # could be Series or DataFrame; compute_signal forces Series
         vix_pct_thresh=float(vix_pct_thresh),
         bb_width_pct_thresh=float(bb_width_pct_thresh),
         cooldown_days=int(cooldown_days),
@@ -255,11 +267,10 @@ colD.markdown(
     f"**Time stop:** exit by **{result['time_stop_date'].isoformat()}** (≈ {result['time_stop_days']} days)"
 )
 
-# Why section
+# Why
 st.subheader("Why")
 p = result["passes"]
 m = result["metrics"]
-
 why_cols = st.columns(3)
 why_cols[0].markdown(
     f"**Cheap vol (VIX percentile)**: `{m['vix_pct']:.1f}` {'✅' if p['vix_ok'] else '❌'}  \n"
@@ -300,9 +311,8 @@ premium_budget = acct_size * (risk_pct / 100.0)
 risk_col3.metric("Max premium budget", f"${premium_budget:,.2f}")
 
 # Log trade
-st.subheader("Log a trade (optional but OP for learning)")
+st.subheader("Log a trade (optional)")
 log_cols = st.columns([1, 1, 1, 1, 1, 1.2])
-
 trade_date = log_cols[0].date_input("Trade date", value=date.today())
 expiry_chosen = log_cols[1].date_input("Expiry chosen", value=earliest_exp)
 call_put = log_cols[2].selectbox("Type", ["CALL", "PUT"], index=0 if result["option_type"] == "CALL" else 1)
@@ -345,7 +355,6 @@ if log_df2.empty:
 else:
     st.dataframe(log_df2.tail(50), use_container_width=True)
 
-# Debug table
 with st.expander("Debug: last 30 rows of indicators"):
     d = result["df"].copy()
     cols = ["close", "ema_20", "vix", "vix_pct", "bb_width_pct", "rv_5", "rv_20"]
