@@ -5,11 +5,11 @@
 # - Logs trades to trades.csv (local)
 #
 # Run:
-#   pip install streamlit yfinance pandas numpy
+#   pip install -r requirements.txt
 #   streamlit run app.py
 
 import math
-from datetime import datetime, timedelta, date
+from datetime import date, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -29,7 +29,6 @@ def ema(series: pd.Series, span: int) -> pd.Series:
 
 
 def realized_vol(log_returns: pd.Series, window: int, annualization: int = 252) -> pd.Series:
-    # Annualized realized vol using rolling std of log returns
     return log_returns.rolling(window).std() * math.sqrt(annualization)
 
 
@@ -38,18 +37,16 @@ def bollinger_bandwidth(close: pd.Series, window: int = 20, n_std: float = 2.0) 
     sd = close.rolling(window).std()
     upper = mid + n_std * sd
     lower = mid - n_std * sd
-    # normalized bandwidth
     return (upper - lower) / mid
 
 
 def rolling_percentile_rank(series: pd.Series, lookback: int = 252) -> pd.Series:
     """
-    Percentile rank (0..100) of the latest value within a rolling window.
-    Lower = "cheaper / more compressed" relative to its own history.
+    Rolling percentile rank (0..100) of the last value in each lookback window.
+    Lower = cheaper/more compressed relative to its own history.
     """
     def _pct_rank(x):
         s = pd.Series(x)
-        # rank(pct=True) gives 0..1, multiply by 100
         return 100.0 * s.rank(pct=True).iloc[-1]
 
     return series.rolling(lookback).apply(_pct_rank, raw=False)
@@ -57,9 +54,9 @@ def rolling_percentile_rank(series: pd.Series, lookback: int = 252) -> pd.Series
 
 def safe_last_row(df: pd.DataFrame) -> pd.Series:
     d = df.dropna()
-    if len(d) == 0:
-        raise ValueError("Not enough data to compute indicators yet.")
-    return d.iloc[-1]
+    if d.empty:
+        raise ValueError("Not enough data to compute indicators yet (need more history).")
+    return d.iloc[-1].copy()
 
 
 # -----------------------------
@@ -71,13 +68,12 @@ def load_daily(symbol: str, period: str = "2y") -> pd.DataFrame:
     if df is None or df.empty:
         raise ValueError(f"No data returned for {symbol}.")
     df = df.rename(columns=str.lower)
-    # yfinance returns timezone-aware index sometimes; make it date-like
     df.index = pd.to_datetime(df.index).tz_localize(None)
     return df
 
 
 # -----------------------------
-# Core signal logic
+# Signal logic
 # -----------------------------
 def compute_signal(
     spy_ohlc: pd.DataFrame,
@@ -105,13 +101,13 @@ def compute_signal(
     df["ema_20"] = ema(df["close"], 20)
 
     # VIX proxy for IV cheapness
-    vix = vix_close.reindex(df.index).ffill()
-    df["vix"] = vix
+    vix_aligned = vix_close.reindex(df.index).ffill()
+    df["vix"] = vix_aligned
     df["vix_pct"] = rolling_percentile_rank(df["vix"], 252)
 
     latest = safe_last_row(df)
 
-    # Cooldown gate (based on calendar days)
+    # Cooldown gate (calendar days)
     if last_trade_date is not None:
         days_since = (date.today() - last_trade_date).days
         cooldown_block = days_since < cooldown_days
@@ -119,21 +115,20 @@ def compute_signal(
         days_since = None
         cooldown_block = False
 
-    # Conditions
-    vix_ok = latest["vix_pct"] < vix_pct_thresh
-    compression_ok = latest["bb_width_pct"] < bb_width_pct_thresh
-    rv_rising = latest["rv_5"] > latest["rv_20"]
+    # Conditions (FORCE scalars)
+    vix_ok = bool(latest["vix_pct"] < vix_pct_thresh)
+    compression_ok = bool(latest["bb_width_pct"] < bb_width_pct_thresh)
+    rv_rising = bool(latest["rv_5"] > latest["rv_20"])
 
     enter = bool(vix_ok and compression_ok and rv_rising and (not cooldown_block))
 
-    # Direction
+    # Direction rule
     if direction_rule == "EMA20":
-        option_type = "CALL" if latest["close"] > latest["ema_20"] else "PUT"
+        option_type = "CALL" if float(latest["close"]) > float(latest["ema_20"]) else "PUT"
     else:
-        # fallback (still EMA20)
-        option_type = "CALL" if latest["close"] > latest["ema_20"] else "PUT"
+        option_type = "CALL" if float(latest["close"]) > float(latest["ema_20"]) else "PUT"
 
-    # Dates you care about
+    # Date guidance
     today = date.today()
     earliest_exp = today + timedelta(days=30)
     latest_exp = today + timedelta(days=45)
@@ -157,11 +152,11 @@ def compute_signal(
             "ema_20": float(latest["ema_20"]),
         },
         "passes": {
-            "vix_ok": bool(vix_ok),
-            "compression_ok": bool(compression_ok),
-            "rv_rising": bool(rv_rising),
+            "vix_ok": vix_ok,
+            "compression_ok": compression_ok,
+            "rv_rising": rv_rising,
         },
-        "df": df,  # for optional display
+        "df": df,
     }
 
 
@@ -180,10 +175,7 @@ def read_log() -> pd.DataFrame:
 def append_log(row: dict) -> None:
     df = read_log()
     new = pd.DataFrame([row])
-    if df is None or df.empty:
-        out = new
-    else:
-        out = pd.concat([df, new], ignore_index=True)
+    out = new if df.empty else pd.concat([df, new], ignore_index=True)
     out.to_csv(LOG_PATH, index=False)
 
 
@@ -196,33 +188,28 @@ st.caption("SPY daily + VIX (IV proxy) → cheap vol + compression + RV rising �
 
 # Sidebar settings
 st.sidebar.header("Settings")
-
-vix_pct_thresh = st.sidebar.slider("VIX percentile threshold (cheap vol)", min_value=5, max_value=50, value=25, step=1)
-bb_width_pct_thresh = st.sidebar.slider("Compression threshold (BB width percentile)", min_value=5, max_value=50, value=20, step=1)
-
-cooldown_days = st.sidebar.slider("Cooldown days (no new trades)", min_value=0, max_value=30, value=8, step=1)
-time_stop_days = st.sidebar.slider("Time stop (exit after N days)", min_value=3, max_value=20, value=10, step=1)
-
-direction_rule = st.sidebar.selectbox("Direction rule", options=["EMA20"], index=0)
+vix_pct_thresh = st.sidebar.slider("VIX percentile threshold (cheap vol)", 5, 50, 25, 1)
+bb_width_pct_thresh = st.sidebar.slider("Compression threshold (BB width percentile)", 5, 50, 20, 1)
+cooldown_days = st.sidebar.slider("Cooldown days (no new trades)", 0, 30, 8, 1)
+time_stop_days = st.sidebar.slider("Time stop (exit after N days)", 3, 20, 10, 1)
+direction_rule = st.sidebar.selectbox("Direction rule", ["EMA20"], index=0)
 
 st.sidebar.divider()
 st.sidebar.subheader("Manual inputs")
 
 log_df = read_log()
+last_trade_date = None
 if not log_df.empty and "trade_date" in log_df.columns:
-    # Parse last trade date from log
     try:
-        log_df["trade_date"] = pd.to_datetime(log_df["trade_date"]).dt.date
-        last_trade_date = max(log_df["trade_date"].dropna()) if len(log_df["trade_date"].dropna()) else None
+        tmp = log_df.copy()
+        tmp["trade_date"] = pd.to_datetime(tmp["trade_date"], errors="coerce").dt.date
+        if tmp["trade_date"].notna().any():
+            last_trade_date = tmp["trade_date"].dropna().max()
     except Exception:
         last_trade_date = None
-else:
-    last_trade_date = None
 
-last_trade_date_override = st.sidebar.date_input(
-    "Last trade date (override)",
-    value=last_trade_date if last_trade_date is not None else date.today() - timedelta(days=999),
-)
+override_default = last_trade_date if last_trade_date is not None else (date.today() - timedelta(days=999))
+last_trade_date_override = st.sidebar.date_input("Last trade date (override)", value=override_default)
 use_override = st.sidebar.checkbox("Use override as last trade date", value=False)
 effective_last_trade = last_trade_date_override if use_override else last_trade_date
 
@@ -236,13 +223,11 @@ with st.spinner("Loading SPY + VIX data..."):
     spy = load_daily("SPY", period="2y")
     vix = load_daily("^VIX", period="2y")
 
-vix_close = vix["close"]
-
 # Compute signal
 try:
     result = compute_signal(
         spy,
-        vix_close,
+        vix_close=vix["close"],
         vix_pct_thresh=float(vix_pct_thresh),
         bb_width_pct_thresh=float(bb_width_pct_thresh),
         cooldown_days=int(cooldown_days),
@@ -256,7 +241,6 @@ except Exception as e:
 
 # Topline badge
 colA, colB, colC, colD = st.columns([1.2, 1, 1.2, 1.6])
-
 enter = result["enter"]
 badge = "✅ TRADE" if enter else "🧊 NO TRADE"
 colA.markdown(f"## {badge}")
@@ -271,7 +255,7 @@ colD.markdown(
     f"**Time stop:** exit by **{result['time_stop_date'].isoformat()}** (≈ {result['time_stop_days']} days)"
 )
 
-# Explain why (pass/fail)
+# Why section
 st.subheader("Why")
 p = result["passes"]
 m = result["metrics"]
@@ -288,21 +272,23 @@ why_cols[2].markdown(
     f"**RV rising**: RV5 `{m['rv_5']:.3f}` vs RV20 `{m['rv_20']:.3f}` {'✅' if p['rv_rising'] else '❌'}"
 )
 
-# Cooldown
 if result["cooldown_block"]:
     st.warning(
         f"Cooldown active: last trade was {result['days_since_last_trade']} days ago "
         f"(need {cooldown_days}). Signal blocked even if conditions pass."
     )
 
-# Trade checklist (manual strike)
-st.subheader("If TRADE = ✅, do this manually (Robinhood)")
+# Checklist
+st.subheader("If ✅ TRADE, do this manually (Robinhood)")
 st.markdown(
     f"- Underlying: **SPY**\n"
     f"- Direction: **{result['option_type']}** (rule: close vs EMA20)\n"
     f"- Expiration: pick a date between **30–45 DTE** (≈ {earliest_exp} to {latest_exp})\n"
     f"- Strike: choose the contract closest to **~25 delta** (manual)\n"
-    f"- Management: set a reminder to exit by **{result['time_stop_date']}** if it’s not working\n"
+    f"- Exits:\n"
+    f"  - Loss cut: **−50%** of premium\n"
+    f"  - Profit: consider taking some at **+75%**\n"
+    f"  - Time stop: if it’s a non-event, exit by **{result['time_stop_date']}**\n"
 )
 
 # Risk helper
@@ -313,16 +299,21 @@ risk_pct = risk_col2.number_input("Max premium risk %", min_value=0.0, value=0.2
 premium_budget = acct_size * (risk_pct / 100.0)
 risk_col3.metric("Max premium budget", f"${premium_budget:,.2f}")
 
-# Log trade section
+# Log trade
 st.subheader("Log a trade (optional but OP for learning)")
 log_cols = st.columns([1, 1, 1, 1, 1, 1.2])
 
 trade_date = log_cols[0].date_input("Trade date", value=date.today())
 expiry_chosen = log_cols[1].date_input("Expiry chosen", value=earliest_exp)
-call_put = log_cols[2].selectbox("Type", options=["CALL", "PUT"], index=0 if result["option_type"] == "CALL" else 1)
-delta_est = log_cols[3].number_input("Delta (manual)", min_value=-1.0, max_value=1.0, value=0.25 if call_put == "CALL" else -0.25, step=0.01)
+call_put = log_cols[2].selectbox("Type", ["CALL", "PUT"], index=0 if result["option_type"] == "CALL" else 1)
+delta_est = log_cols[3].number_input(
+    "Delta (manual)",
+    min_value=-1.0,
+    max_value=1.0,
+    value=0.25 if call_put == "CALL" else -0.25,
+    step=0.01,
+)
 premium_paid = log_cols[4].number_input("Premium paid ($)", min_value=0.0, value=0.0, step=10.0)
-
 notes = log_cols[5].text_input("Notes", value="")
 
 if st.button("➕ Add to trades.csv"):
@@ -354,7 +345,7 @@ if log_df2.empty:
 else:
     st.dataframe(log_df2.tail(50), use_container_width=True)
 
-# Optional: show last N rows of computed dataframe
+# Debug table
 with st.expander("Debug: last 30 rows of indicators"):
     d = result["df"].copy()
     cols = ["close", "ema_20", "vix", "vix_pct", "bb_width_pct", "rv_5", "rv_20"]
