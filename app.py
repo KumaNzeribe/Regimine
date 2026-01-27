@@ -1,5 +1,7 @@
 # app.py
 # Regime Radar (Simple UI): Bullish / Bearish / Chop
+# CHOP only applies when NOT trending (ADX below threshold)
+#
 # Run:
 #   pip install streamlit yfinance pandas numpy
 #   streamlit run app.py
@@ -31,12 +33,12 @@ show_table = st.toggle("Show table", value=False)
 # ----------------------------
 EMA_FAST = 50
 EMA_SLOW = 200
+
 ADX_LEN = 14
-ADX_TREND_TH = 20
+ADX_TREND_TH = 20  # trending if ADX >= 20
 
 CHOP_LEN = 14
-CHOP_CHOPPY_TH = 61
-CHOP_TREND_TH = 38
+CHOP_CHOPPY_TH = 61  # choppy if CHOP >= 61 AND not trending
 
 INTERVAL_MAP = {"Daily": "1d", "4H": "4h", "1H": "1h"}
 
@@ -56,7 +58,7 @@ def get_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
 
-    # yfinance can return MultiIndex columns
+    # yfinance sometimes returns MultiIndex columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
 
@@ -69,9 +71,7 @@ def ema(series: pd.Series, n: int) -> pd.Series:
 
 
 def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """
-    Wilder-style ADX (trend strength).
-    """
+    """Wilder-style ADX (trend strength)."""
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
@@ -88,7 +88,6 @@ def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     tr1 = (high - low).to_numpy()
     tr2 = (high - close.shift()).abs().to_numpy()
     tr3 = (low - close.shift()).abs().to_numpy()
-
     tr = np.nanmax(np.vstack([tr1, tr2, tr3]), axis=0)
     tr = pd.Series(tr, index=df.index)
 
@@ -102,9 +101,7 @@ def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
 
 
 def choppiness_index(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """
-    CHOP (range/chop detector).
-    """
+    """CHOP (range/chop detector)."""
     high = df["High"]
     low = df["Low"]
     close = df["Close"]
@@ -125,6 +122,7 @@ def choppiness_index(df: pd.DataFrame, n: int = 14) -> pd.Series:
 def classify_regime(df: pd.DataFrame) -> dict:
     df = df.copy()
 
+    # Indicators
     df["EMA_FAST"] = ema(df["Close"], EMA_FAST)
     df["EMA_SLOW"] = ema(df["Close"], EMA_SLOW)
     df["ADX"] = adx(df, ADX_LEN)
@@ -133,33 +131,40 @@ def classify_regime(df: pd.DataFrame) -> dict:
     dfx = df.dropna()
     last = dfx.iloc[-1]
 
-    is_chop = last["CHOP"] >= CHOP_CHOPPY_TH
-    is_trend = (last["CHOP"] <= CHOP_TREND_TH) and (last["ADX"] >= ADX_TREND_TH)
-
+    # Direction from EMA structure
     ema_bull = (last["Close"] > last["EMA_SLOW"]) and (last["EMA_FAST"] > last["EMA_SLOW"])
     ema_bear = (last["Close"] < last["EMA_SLOW"]) and (last["EMA_FAST"] < last["EMA_SLOW"])
 
-    reasons = []
-    reasons.append(f"EMA50 vs EMA200: {last['EMA_FAST']:.2f} vs {last['EMA_SLOW']:.2f}")
-    reasons.append(f"ADX({ADX_LEN}) = {last['ADX']:.2f} (trend ≥ {ADX_TREND_TH})")
-    reasons.append(f"CHOP({CHOP_LEN}) = {last['CHOP']:.2f} (chop ≥ {CHOP_CHOPPY_TH}, trend ≤ {CHOP_TREND_TH})")
+    # Trend authority (ADX)
+    is_trend = last["ADX"] >= ADX_TREND_TH
 
-    if is_chop:
-        regime = "CHOP"
-        allowed = ["Smaller size", "Defined-risk only", "Avoid forcing spreads"]
-        reasons.insert(0, "CHOP is high → market is range/chop.")
-    elif is_trend and ema_bull:
+    # ✅ CHOP only matters if NOT trending
+    is_chop = (last["CHOP"] >= CHOP_CHOPPY_TH) and (not is_trend)
+
+    reasons = []
+    reasons.append(f"Close: {last['Close']:.2f}")
+    reasons.append(f"EMA50 vs EMA200: {last['EMA_FAST']:.2f} vs {last['EMA_SLOW']:.2f}")
+    reasons.append(f"ADX({ADX_LEN}) = {last['ADX']:.2f} (trend if ≥ {ADX_TREND_TH})")
+    reasons.append(f"CHOP({CHOP_LEN}) = {last['CHOP']:.2f} (chop if ≥ {CHOP_CHOPPY_TH} AND not trending)")
+    reasons.append(f"CHOP override rule: only if ADX < {ADX_TREND_TH}")
+
+    # ✅ Regime decision (trend first)
+    if is_trend and ema_bull:
         regime = "BULLISH"
         allowed = ["Put spreads allowed", "Cash-secured puts allowed", "Buy-writes OK"]
         reasons.insert(0, "Trend confirmed + bullish EMA alignment.")
     elif is_trend and ema_bear:
         regime = "BEARISH"
-        allowed = ["Call spreads allowed", "Avoid put-selling unless base/reclaim", "Hedges OK"]
+        allowed = ["Call spreads allowed", "Bearish hedges OK", "Avoid put-selling unless base/reclaim"]
         reasons.insert(0, "Trend confirmed + bearish EMA alignment.")
+    elif is_chop:
+        regime = "CHOP"
+        allowed = ["Small size only", "Defined-risk only", "Avoid forcing spreads"]
+        reasons.insert(0, "CHOP is high and ADX is weak → range/chop.")
     else:
         regime = "CHOP"
-        allowed = ["Transition zone → treat as chop", "Wait for confirmation", "Smaller size"]
-        reasons.insert(0, "Mixed signals → treat as chop for safety.")
+        allowed = ["Mixed/transition → treat as chop", "Wait for confirmation", "Smaller size"]
+        reasons.insert(0, "Signals are mixed or trend is weak → treat as chop for safety.")
 
     return {"df": dfx, "last": last, "regime": regime, "allowed": allowed, "reasons": reasons}
 
@@ -178,9 +183,9 @@ if df.empty:
     st.error("No data returned. Check ticker or timeframe.")
     st.stop()
 
-# Need enough rows for EMA200 and indicators
+# Need enough rows for EMA200 + indicators
 if len(df) < 250:
-    st.warning("Not enough candles for EMA200 + indicators. Try a longer lookback (2y/5y) or Daily.")
+    st.warning("Not enough candles for EMA200 + indicators. Try longer lookback (2y/5y) or Daily.")
     st.stop()
 
 out = classify_regime(df)
@@ -217,6 +222,7 @@ cA, cB = st.columns(2)
 with cA:
     st.markdown("**Price + EMAs**")
     st.line_chart(chart[["Close", "EMA_FAST", "EMA_SLOW"]])
+
 with cB:
     st.markdown("**ADX + CHOP**")
     st.line_chart(chart[["ADX", "CHOP"]])
