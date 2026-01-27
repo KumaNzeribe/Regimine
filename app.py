@@ -1,232 +1,218 @@
 # app.py
-# Regime Radar (Simple UI): Bullish / Bearish / Chop
-# CHOP only applies when NOT trending (ADX below threshold)
+# Regime + Chop + VIX + Range Location (Minimal UI, System-Style)
 #
 # Run:
 #   pip install streamlit yfinance pandas numpy
 #   streamlit run app.py
 
 import streamlit as st
+import yfinance as yf
 import pandas as pd
 import numpy as np
-import yfinance as yf
 
-st.set_page_config(page_title="Regime Radar", layout="wide")
-st.title("📈 Regime Radar")
-st.caption("Simple UI. Smart engine. Outputs: Bullish / Bearish / Chop.")
+# -------------------------------------------------
+# Page setup
+# -------------------------------------------------
+st.set_page_config(page_title="Regime System", layout="centered")
+st.title("Regime + Chop System")
+st.caption("Minimal UI. Uses MA Regime + Chop (band/cross) + VIX + ATR Range Location.")
 
-# ----------------------------
-# UI (minimal)
-# ----------------------------
-col1, col2, col3 = st.columns([2, 1, 1])
-with col1:
-    ticker = st.text_input("Ticker", value="SPY").upper().strip()
-with col2:
-    timeframe = st.selectbox("Timeframe", ["Daily", "4H", "1H"], index=0)
-with col3:
-    lookback = st.selectbox("Lookback", ["6mo", "1y", "2y", "5y"], index=1)
-
+# -------------------------------------------------
+# Minimal UI
+# -------------------------------------------------
+ticker = st.text_input("Ticker", value="SPY").upper().strip()
+use_vix = st.toggle("Use VIX filter (SPY/Index ETFs)", value=True)
 show_table = st.toggle("Show table", value=False)
 
-# ----------------------------
-# Fixed settings (no sliders)
-# ----------------------------
-EMA_FAST = 50
-EMA_SLOW = 200
+# -------------------------------------------------
+# Fixed system parameters (no sliders)
+# -------------------------------------------------
+# Regime
+MA_FAST = 20
+MA_SLOW = 50
+DEAD_ZONE = 0.001  # 0.10% dead-zone to reduce flip-flopping
 
-ADX_LEN = 14
-ADX_TREND_TH = 20  # trending if ADX >= 20
+# Chop detection
+DIST_BAND = 0.006         # 0.6% distance from MA_SLOW
+CROSS_LOOKBACK = 10       # days to count crosses around MA_SLOW
+CROSS_THRESHOLD = 3       # crosses >= this => chop
 
-CHOP_LEN = 14
-CHOP_CHOPPY_TH = 61  # choppy if CHOP >= 61 AND not trending
+# VIX filter
+VIX_THRESHOLD = 20
 
-INTERVAL_MAP = {"Daily": "1d", "4H": "4h", "1H": "1h"}
+# Range / ATR
+RANGE_LOOKBACK = 20
+ATR_LOOKBACK = 14
+ATR_BUFFER = 0.25         # 25% of ATR from range edges
 
-# ----------------------------
-# Data + indicators
-# ----------------------------
-@st.cache_data(show_spinner=False)
-def get_data(ticker: str, period: str, interval: str) -> pd.DataFrame:
-    df = yf.download(
-        ticker,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        progress=False,
-        threads=True,
-    )
+# Data
+PERIOD = "2y"
+INTERVAL = "1d"
+
+# -------------------------------------------------
+# Data loading
+# -------------------------------------------------
+@st.cache_data(ttl=900, show_spinner=False)
+def load_price_data(t: str) -> pd.DataFrame:
+    df = yf.download(t, period=PERIOD, interval=INTERVAL, auto_adjust=True, progress=False)
     if df is None or df.empty:
         return pd.DataFrame()
-
-    # yfinance sometimes returns MultiIndex columns
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
+    return df.dropna()
 
-    df = df.dropna()
-    return df
+@st.cache_data(ttl=900, show_spinner=False)
+def load_vix() -> pd.DataFrame:
+    v = yf.download("^VIX", period="60d", interval="1d", auto_adjust=True, progress=False)
+    if v is None or v.empty:
+        return pd.DataFrame()
+    if isinstance(v.columns, pd.MultiIndex):
+        v.columns = v.columns.get_level_values(0)
+    return v.dropna()
 
-
-def ema(series: pd.Series, n: int) -> pd.Series:
-    return series.ewm(span=n, adjust=False).mean()
-
-
-def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """Wilder-style ADX (trend strength)."""
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    up = up_move.to_numpy()
-    down = down_move.to_numpy()
-
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    tr1 = (high - low).to_numpy()
-    tr2 = (high - close.shift()).abs().to_numpy()
-    tr3 = (low - close.shift()).abs().to_numpy()
-    tr = np.nanmax(np.vstack([tr1, tr2, tr3]), axis=0)
-    tr = pd.Series(tr, index=df.index)
-
-    atr = tr.ewm(alpha=1 / n, adjust=False).mean()
-
-    plus_di = 100 * (pd.Series(plus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm, index=df.index).ewm(alpha=1 / n, adjust=False).mean() / atr)
-
-    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di)).replace([np.inf, -np.inf], np.nan)
-    return dx.ewm(alpha=1 / n, adjust=False).mean()
-
-
-def choppiness_index(df: pd.DataFrame, n: int = 14) -> pd.Series:
-    """CHOP (range/chop detector)."""
-    high = df["High"]
-    low = df["Low"]
-    close = df["Close"]
-
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low - close.shift()).abs()
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr_sum = tr.rolling(n).sum()
-    hh = high.rolling(n).max()
-    ll = low.rolling(n).min()
-    denom = (hh - ll).replace(0, np.nan)
-
-    return 100 * np.log10(atr_sum / denom) / np.log10(n)
-
-
-def classify_regime(df: pd.DataFrame) -> dict:
-    df = df.copy()
-
-    # Indicators
-    df["EMA_FAST"] = ema(df["Close"], EMA_FAST)
-    df["EMA_SLOW"] = ema(df["Close"], EMA_SLOW)
-    df["ADX"] = adx(df, ADX_LEN)
-    df["CHOP"] = choppiness_index(df, CHOP_LEN)
-
-    dfx = df.dropna()
-    last = dfx.iloc[-1]
-
-    # Direction from EMA structure
-    ema_bull = (last["Close"] > last["EMA_SLOW"]) and (last["EMA_FAST"] > last["EMA_SLOW"])
-    ema_bear = (last["Close"] < last["EMA_SLOW"]) and (last["EMA_FAST"] < last["EMA_SLOW"])
-
-    # Trend authority (ADX)
-    is_trend = last["ADX"] >= ADX_TREND_TH
-
-    # ✅ CHOP only matters if NOT trending
-    is_chop = (last["CHOP"] >= CHOP_CHOPPY_TH) and (not is_trend)
-
-    reasons = []
-    reasons.append(f"Close: {last['Close']:.2f}")
-    reasons.append(f"EMA50 vs EMA200: {last['EMA_FAST']:.2f} vs {last['EMA_SLOW']:.2f}")
-    reasons.append(f"ADX({ADX_LEN}) = {last['ADX']:.2f} (trend if ≥ {ADX_TREND_TH})")
-    reasons.append(f"CHOP({CHOP_LEN}) = {last['CHOP']:.2f} (chop if ≥ {CHOP_CHOPPY_TH} AND not trending)")
-    reasons.append(f"CHOP override rule: only if ADX < {ADX_TREND_TH}")
-
-    # ✅ Regime decision (trend first)
-    if is_trend and ema_bull:
-        regime = "BULLISH"
-        allowed = ["Put spreads allowed", "Cash-secured puts allowed", "Buy-writes OK"]
-        reasons.insert(0, "Trend confirmed + bullish EMA alignment.")
-    elif is_trend and ema_bear:
-        regime = "BEARISH"
-        allowed = ["Call spreads allowed", "Bearish hedges OK", "Avoid put-selling unless base/reclaim"]
-        reasons.insert(0, "Trend confirmed + bearish EMA alignment.")
-    elif is_chop:
-        regime = "CHOP"
-        allowed = ["Small size only", "Defined-risk only", "Avoid forcing spreads"]
-        reasons.insert(0, "CHOP is high and ADX is weak → range/chop.")
-    else:
-        regime = "CHOP"
-        allowed = ["Mixed/transition → treat as chop", "Wait for confirmation", "Smaller size"]
-        reasons.insert(0, "Signals are mixed or trend is weak → treat as chop for safety.")
-
-    return {"df": dfx, "last": last, "regime": regime, "allowed": allowed, "reasons": reasons}
-
-
-# ----------------------------
-# App run
-# ----------------------------
 if not ticker:
     st.info("Type a ticker to start.")
     st.stop()
 
-interval = INTERVAL_MAP[timeframe]
-df = get_data(ticker, lookback, interval)
-
-if df.empty:
-    st.error("No data returned. Check ticker or timeframe.")
+df = load_price_data(ticker)
+if df.empty or len(df) < 120:
+    st.error("Insufficient data loaded. Try a more liquid ticker.")
     st.stop()
 
-# Need enough rows for EMA200 + indicators
-if len(df) < 250:
-    st.warning("Not enough candles for EMA200 + indicators. Try longer lookback (2y/5y) or Daily.")
-    st.stop()
+vix_df = load_vix() if use_vix else pd.DataFrame()
 
-out = classify_regime(df)
-last = out["last"]
+# -------------------------------------------------
+# Indicators
+# -------------------------------------------------
+df = df.copy()
+df["MA_FAST"] = df["Close"].ewm(span=MA_FAST, adjust=False).mean()
+df["MA_SLOW"] = df["Close"].ewm(span=MA_SLOW, adjust=False).mean()
 
-# Big label
-if out["regime"] == "BULLISH":
-    st.success(f"✅ {ticker} Regime: **BULLISH**")
-elif out["regime"] == "BEARISH":
-    st.error(f"🟥 {ticker} Regime: **BEARISH**")
+close = float(df["Close"].iloc[-1])
+ma_fast = float(df["MA_FAST"].iloc[-1])
+ma_slow = float(df["MA_SLOW"].iloc[-1])
+
+# -------------------------------------------------
+# Regime (EMA20/EMA50 + dead zone)
+# -------------------------------------------------
+diff = (ma_fast - ma_slow) / ma_slow
+if diff > DEAD_ZONE:
+    regime = "BULLISH"
+elif diff < -DEAD_ZONE:
+    regime = "BEARISH"
 else:
-    st.warning(f"🟨 {ticker} Regime: **CHOP**")
+    regime = "CHOP"  # neutral/transition treated as chop
 
-# Quick metrics
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Close", f"{last['Close']:.2f}")
-m2.metric("EMA50", f"{last['EMA_FAST']:.2f}")
-m3.metric("EMA200", f"{last['EMA_SLOW']:.2f}")
-m4.metric("ADX / CHOP", f"{last['ADX']:.1f} / {last['CHOP']:.1f}")
+# -------------------------------------------------
+# Chop detection (distance band + cross count around MA_SLOW)
+# -------------------------------------------------
+distance_pct = abs(close - ma_slow) / ma_slow
+chop_distance = distance_pct < DIST_BAND
 
-# Playbook
-st.subheader("Playbook")
-st.write("• " + "\n• ".join(out["allowed"]))
+recent = df.tail(CROSS_LOOKBACK + 1).dropna(subset=["Close", "MA_SLOW"])
+above = recent["Close"] > recent["MA_SLOW"]
+crosses = int((above != above.shift()).sum() - 1)
+chop_cross = crosses >= CROSS_THRESHOLD
 
-# Why
-with st.expander("Why this regime?"):
-    st.write("• " + "\n• ".join(out["reasons"]))
+chop = bool(chop_distance or chop_cross)
 
-# Charts
-st.subheader("Charts")
-chart = out["df"][["Close", "EMA_FAST", "EMA_SLOW", "ADX", "CHOP"]].tail(300)
+# -------------------------------------------------
+# VIX filter
+# -------------------------------------------------
+vix_value = None
+if use_vix:
+    if vix_df.empty:
+        st.warning("VIX data not available. VIX filter will be ignored.")
+        vol_ok = True
+    else:
+        vix_value = float(vix_df["Close"].iloc[-1])
+        vol_ok = vix_value < VIX_THRESHOLD
+else:
+    vol_ok = True
 
-cA, cB = st.columns(2)
-with cA:
-    st.markdown("**Price + EMAs**")
-    st.line_chart(chart[["Close", "EMA_FAST", "EMA_SLOW"]])
+# -------------------------------------------------
+# ATR + Range Location
+# -------------------------------------------------
+high = df["High"]
+low = df["Low"]
+prev_close = df["Close"].shift()
 
-with cB:
-    st.markdown("**ADX + CHOP**")
-    st.line_chart(chart[["ADX", "CHOP"]])
+tr = pd.concat(
+    [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
+    axis=1
+).max(axis=1)
+
+df["ATR"] = tr.rolling(ATR_LOOKBACK).mean()
+
+support = float(low.rolling(RANGE_LOOKBACK).min().iloc[-1])
+resistance = float(high.rolling(RANGE_LOOKBACK).max().iloc[-1])
+atr = float(df["ATR"].iloc[-1])
+
+near_support = close <= support + ATR_BUFFER * atr
+near_resistance = close >= resistance - ATR_BUFFER * atr
+mid_range = not (near_support or near_resistance)
+
+location = "Mid-Range"
+if near_support:
+    location = "Near Support"
+elif near_resistance:
+    location = "Near Resistance"
+
+# -------------------------------------------------
+# Final decision logic (system switch)
+# -------------------------------------------------
+system_on = vol_ok and (not chop) and (not mid_range)
+
+direction = "NO TRADE"
+if system_on:
+    if regime == "BULLISH" and near_support:
+        direction = "PUT CREDIT SPREADS"
+    elif regime == "BEARISH" and near_resistance:
+        direction = "CALL CREDIT SPREADS"
+    else:
+        system_on = False
+        direction = "NO TRADE (Location/Regime mismatch)"
+
+# -------------------------------------------------
+# UI OUTPUT
+# -------------------------------------------------
+st.subheader("Market Snapshot")
+
+c1, c2, c3 = st.columns(3)
+c1.metric("Close", f"{close:,.2f}")
+c2.metric(f"EMA {MA_FAST}/{MA_SLOW}", f"{ma_fast:,.2f} / {ma_slow:,.2f}")
+if use_vix:
+    c3.metric("VIX", "—" if vix_value is None else f"{vix_value:,.2f}")
+else:
+    c3.metric("VIX", "OFF")
+
+st.write("### System Filters")
+st.write(f"- Regime: **{regime}** (EMA{MA_FAST} vs EMA{MA_SLOW}, dead-zone {DEAD_ZONE*100:.2f}%)")
+st.write(f"- Volatility OK: **{'YES' if vol_ok else 'NO'}**" + (f" (VIX<{VIX_THRESHOLD})" if use_vix and vix_value is not None else ""))
+st.write(f"- Chop Detected: **{'YES' if chop else 'NO'}**")
+st.write(f"- Distance from EMA{MA_SLOW}: **{distance_pct*100:.2f}%** (band < {DIST_BAND*100:.2f}%)")
+st.write(f"- Crosses around EMA{MA_SLOW} ({CROSS_LOOKBACK}d): **{crosses}** (threshold ≥ {CROSS_THRESHOLD})")
+
+st.write("### Range Location")
+st.write(f"- Support ({RANGE_LOOKBACK}d): **{support:,.2f}**")
+st.write(f"- Resistance ({RANGE_LOOKBACK}d): **{resistance:,.2f}**")
+st.write(f"- ATR ({ATR_LOOKBACK}): **{atr:,.2f}**")
+st.write(f"- Location: **{location}**")
+
+st.write("---")
+
+if system_on:
+    st.success(f"SYSTEM ON → {direction}")
+else:
+    st.error(f"SYSTEM OFF → {direction}")
+
+# Charts (simple)
+st.write("### Charts")
+chart = df[["Close", "MA_FAST", "MA_SLOW"]].dropna().tail(260)
+st.line_chart(chart)
 
 if show_table:
-    st.subheader("Latest rows")
-    st.dataframe(chart.tail(60))
+    st.write("### Latest rows")
+    st.dataframe(df.tail(60))
+
+st.caption("Educational tool only. Not financial advice.")
