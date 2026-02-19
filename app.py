@@ -1,5 +1,5 @@
 # app.py
-# Regime + Trend Strength + Chop + VIX Band + Extension Trigger (Minimal UI, System-Style)
+# Regime + Trend Strength + Chop + VIX Band + ATR Extension + ENTRY LEVELS (Minimal UI)
 #
 # Run:
 #   pip install streamlit yfinance pandas numpy
@@ -15,7 +15,7 @@ import numpy as np
 # -------------------------------------------------
 st.set_page_config(page_title="Regime System", layout="centered")
 st.title("Regime + Trend System")
-st.caption("Minimal UI. EMA Regime + ADX Trend + Chop + VIX Band + ATR Extension Trigger.")
+st.caption("Minimal UI. EMA Regime + ADX Trend + Chop + VIX Band + ATR Extension + Entry Levels.")
 
 # -------------------------------------------------
 # Minimal UI
@@ -30,16 +30,16 @@ show_table = st.toggle("Show table", value=False)
 # Regime (EMA20/EMA50 + dead zone)
 MA_FAST = 20
 MA_SLOW = 50
-DEAD_ZONE = 0.001  # 0.10% dead-zone to reduce flip-flopping
+DEAD_ZONE = 0.001  # 0.10% dead-zone
 
 # Trend strength (ADX)
 ADX_LOOKBACK = 14
 ADX_MIN = 18
 
 # Chop detection (distance band + cross count around EMA_SLOW)
-DIST_BAND = 0.006         # 0.6% distance from EMA_SLOW
-CROSS_LOOKBACK = 10       # days to count crosses around EMA_SLOW
-CROSS_THRESHOLD = 3       # crosses >= this => chop-ish
+DIST_BAND = 0.006
+CROSS_LOOKBACK = 10
+CROSS_THRESHOLD = 3
 
 # VIX band (income-optimized but risk-aware)
 VIX_LOW = 14
@@ -47,7 +47,7 @@ VIX_HIGH = 28
 
 # ATR / Extension trigger
 ATR_LOOKBACK = 14
-EXT_THRESH = 0.75         # extension in ATR units vs EMA20
+EXT_THRESH = 0.75  # in ATR units vs EMA20
 
 # Data
 PERIOD = "2y"
@@ -63,8 +63,7 @@ def load_price_data(t: str) -> pd.DataFrame:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    df = df.dropna()
-    return df
+    return df.dropna()
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_vix() -> pd.DataFrame:
@@ -81,11 +80,10 @@ def load_vix() -> pd.DataFrame:
 def true_range(df: pd.DataFrame) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
     prev_close = close.shift(1)
-    tr = pd.concat(
+    return pd.concat(
         [(high - low), (high - prev_close).abs(), (low - prev_close).abs()],
         axis=1
     ).max(axis=1)
-    return tr
 
 def adx(df: pd.DataFrame, n: int = 14) -> pd.Series:
     high, low, close = df["High"], df["Low"], df["Close"]
@@ -126,11 +124,8 @@ df = df.copy()
 df["EMA_FAST"] = df["Close"].ewm(span=MA_FAST, adjust=False).mean()
 df["EMA_SLOW"] = df["Close"].ewm(span=MA_SLOW, adjust=False).mean()
 
-# ATR
 df["TR"] = true_range(df)
 df["ATR"] = df["TR"].rolling(ATR_LOOKBACK).mean()
-
-# ADX
 df["ADX"] = adx(df, ADX_LOOKBACK)
 
 # Latest values
@@ -141,7 +136,7 @@ atr = float(df["ATR"].iloc[-1]) if not np.isnan(df["ATR"].iloc[-1]) else np.nan
 adx_value = float(df["ADX"].iloc[-1]) if not np.isnan(df["ADX"].iloc[-1]) else np.nan
 
 # -------------------------------------------------
-# Regime (EMA20/EMA50 + dead zone)
+# Regime
 # -------------------------------------------------
 diff = (ema_fast - ema_slow) / ema_slow
 if diff > DEAD_ZONE:
@@ -151,15 +146,11 @@ elif diff < -DEAD_ZONE:
 else:
     regime = "NEUTRAL"
 
-# -------------------------------------------------
-# Trend gate (ADX)
-# -------------------------------------------------
+# Trend gate
 trend_ok = (not np.isnan(adx_value)) and (adx_value >= ADX_MIN)
 
 # -------------------------------------------------
-# Chop detection (distance band + cross count around EMA_SLOW)
-#   - Use ADX as primary: if trend_ok is False => chop
-#   - Otherwise, require BOTH cross + distance to call it chop (reduces false chop in trends)
+# Chop detection (trend-aware)
 # -------------------------------------------------
 distance_pct = abs(close - ema_slow) / ema_slow
 chop_distance = distance_pct < DIST_BAND
@@ -169,6 +160,8 @@ above = recent["Close"] > recent["EMA_SLOW"]
 crosses = int((above != above.shift()).sum() - 1) if len(above) > 1 else 0
 chop_cross = crosses >= CROSS_THRESHOLD
 
+# If no trend (ADX) => chop.
+# If trend exists, only call chop when BOTH conditions agree.
 chop = (not trend_ok) or (chop_cross and chop_distance)
 
 # -------------------------------------------------
@@ -186,40 +179,51 @@ else:
     vol_ok = True
 
 # -------------------------------------------------
-# Extension trigger (ATR-normalized distance vs EMA20)
+# Extension + ENTRY LEVELS (the missing piece)
 # -------------------------------------------------
 extension = np.nan
+bull_entry_price = np.nan
+bear_entry_price = np.nan
+
 if (not np.isnan(atr)) and atr != 0:
     extension = (close - ema_fast) / atr
 
-pullback_ok = (regime == "BULLISH") and (not np.isnan(extension)) and (extension <= -EXT_THRESH)
-rally_ok = (regime == "BEARISH") and (not np.isnan(extension)) and (extension >= EXT_THRESH)
+    # If bullish: we want a pullback to at least EXT_THRESH ATR below EMA20
+    bull_entry_price = ema_fast - EXT_THRESH * atr
+
+    # If bearish: we want a rally to at least EXT_THRESH ATR above EMA20
+    bear_entry_price = ema_fast + EXT_THRESH * atr
+
+pullback_ok = (regime == "BULLISH") and (not np.isnan(close)) and (not np.isnan(bull_entry_price)) and (close <= bull_entry_price)
+rally_ok = (regime == "BEARISH") and (not np.isnan(close)) and (not np.isnan(bear_entry_price)) and (close >= bear_entry_price)
 
 # -------------------------------------------------
-# Final decision logic (system switch)
+# Final decision logic
 # -------------------------------------------------
-# System ON when:
-# - VIX in band (or VIX off)
-# - Trend is strong enough (ADX gate via chop)
-# - Not chop
 system_on = vol_ok and (not chop)
 
 direction = "NO TRADE"
 reason = ""
+next_level = ""
 
 if system_on:
     if pullback_ok:
         direction = "PUT CREDIT SPREADS"
-        reason = f"Bull regime + pullback (ext ≤ -{EXT_THRESH})"
+        reason = "Bull regime + pullback hit"
     elif rally_ok:
         direction = "CALL CREDIT SPREADS"
-        reason = f"Bear regime + rally (ext ≥ +{EXT_THRESH})"
+        reason = "Bear regime + rally hit"
     else:
-        system_on = False
-        direction = "NO TRADE"
-        reason = "No extension trigger"
+        direction = "WAIT (No entry hit yet)"
+        reason = "Trend OK, filters OK, but price not at entry level"
+
+        if regime == "BULLISH" and not np.isnan(bull_entry_price):
+            next_level = f"Wait for Close ≤ {bull_entry_price:,.2f} (EMA20 - {EXT_THRESH}×ATR)"
+        elif regime == "BEARISH" and not np.isnan(bear_entry_price):
+            next_level = f"Wait for Close ≥ {bear_entry_price:,.2f} (EMA20 + {EXT_THRESH}×ATR)"
+        else:
+            next_level = "No entry level (neutral regime)"
 else:
-    # Helpful reason string
     blockers = []
     if not vol_ok:
         blockers.append("VIX out of band")
@@ -241,22 +245,32 @@ c4.metric("Ext (ATR vs EMA20)", "—" if np.isnan(extension) else f"{extension:,
 st.write("### System Filters")
 st.write(f"- Regime: **{regime}** (EMA{MA_FAST} vs EMA{MA_SLOW}, dead-zone {DEAD_ZONE*100:.2f}%)")
 st.write(f"- Trend OK (ADX ≥ {ADX_MIN}): **{'YES' if trend_ok else 'NO'}**")
-st.write(f"- VIX Filter: **{'ON' if use_vix else 'OFF'}**" + (
-    f" (VIX {vix_value:,.2f} in [{VIX_LOW}, {VIX_HIGH}])" if use_vix and vix_value is not None else ""
+st.write(f"- Volatility OK: **{'YES' if vol_ok else 'NO'}**" + (
+    f" (VIX {vix_value:,.2f} in [{VIX_LOW}, {VIX_HIGH}])" if use_vix and vix_value is not None else
+    (" (VIX ignored)" if not use_vix else "")
 ))
-st.write(f"- Volatility OK: **{'YES' if vol_ok else 'NO'}**")
 st.write(f"- Chop Detected: **{'YES' if chop else 'NO'}**")
 st.write(f"- Distance from EMA{MA_SLOW}: **{distance_pct*100:.2f}%** (band < {DIST_BAND*100:.2f}%)")
 st.write(f"- Crosses around EMA{MA_SLOW} ({CROSS_LOOKBACK}d): **{crosses}** (threshold ≥ {CROSS_THRESHOLD})")
 st.write(f"- ATR ({ATR_LOOKBACK}): **{'—' if np.isnan(atr) else f'{atr:,.2f}'}**")
-st.write(f"- Extension trigger threshold: **±{EXT_THRESH} ATR**")
+st.write(f"- Entry trigger: **±{EXT_THRESH} ATR vs EMA20**")
+
+st.write("### Entry Levels (What price must do)")
+if regime == "BULLISH":
+    st.write(f"- Bull pullback entry level: **Close ≤ {bull_entry_price:,.2f}**")
+elif regime == "BEARISH":
+    st.write(f"- Bear rally entry level: **Close ≥ {bear_entry_price:,.2f}**")
+else:
+    st.write("- Neutral regime: **No entry level (stand down)**")
 
 st.write("---")
 
-if system_on:
+if system_on and (direction in ["PUT CREDIT SPREADS", "CALL CREDIT SPREADS"]):
     st.success(f"SYSTEM ON → {direction}  \n**Reason:** {reason}")
+elif system_on and direction.startswith("WAIT"):
+    st.warning(f"SYSTEM READY → {direction}  \n**Reason:** {reason}  \n**Next:** {next_level}")
 else:
-    st.error(f"SYSTEM OFF → {direction}  \n**Reason:** {reason}")
+    st.error(f"SYSTEM OFF → NO TRADE  \n**Reason:** {reason}")
 
 # Charts (simple)
 st.write("### Charts")
